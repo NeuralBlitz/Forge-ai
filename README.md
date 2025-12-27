@@ -1033,4 +1033,1027 @@ loguru>=0.5.3
 
 ---
 
-This framework provides a solid foundation for building and managing complex AI experiments with high engineering standards.
+
+---
+
+### **AIForge: Enterprise-Ready AI Framework**
+
+---
+
+### **I. Updated Directory Structure**
+
+```
+aiforge/
+├── __init__.py
+├── core/
+│   ├── __init__.py
+│   ├── logger.py
+│   ├── base_model.py         # Updated for DDP-aware checkpointing
+│   ├── data_pipeline.py
+│   └── orchestrator.py       # Updated for DDP, MLflow, and injected dependencies
+├── config/
+│   ├── __init__.py
+│   ├── settings.py
+│   └── model_configs.py      # Updated with distributed training options
+├── plugins/
+│   ├── __init__.py
+│   └── simple_nn/
+│       ├── __init__.py
+│       ├── model.py
+│       ├── dataset.py
+│       └── preprocessor.py
+├── utils/
+│   ├── __init__.py
+│   ├── metrics.py
+│   └── callbacks.py          # Added MLflowCallback
+├── container.py              # NEW: Dependency Injection Container definition
+├── main.py                   # Updated to use the DI container and manage DDP setup
+└── requirements.txt          # Updated dependencies
+```
+
+---
+
+### **II. Updated & New Components**
+
+#### **1. `requirements.txt`**
+Add the new dependencies.
+
+```
+# aiforge/requirements.txt
+torch>=1.10.0
+pydantic>=1.8.0
+loguru>=0.5.3
+mlflow>=1.20.0
+dependency-injector>=4.0.0
+# Optional:
+# scikit-learn # if using sklearn for metrics/preprocessing
+```
+
+#### **2. `aiforge/config/model_configs.py`**
+Add distributed training configuration.
+
+```python
+# aiforge/config/model_configs.py
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Literal, Optional
+
+class TrainingConfig(BaseModel):
+    """Configuration for the training loop."""
+    epochs: int = Field(10, description="Number of training epochs")
+    batch_size: int = Field(32, description="Batch size for training and validation")
+    learning_rate: float = Field(0.001, description="Learning rate for the optimizer")
+    optimizer_name: Literal["Adam", "SGD", "RMSprop"] = Field("Adam", description="Name of the PyTorch optimizer")
+    loss_fn_name: Literal["CrossEntropyLoss", "MSELoss", "BCELoss", "L1Loss"] = Field("CrossEntropyLoss", description="Name of the PyTorch loss function")
+    gradient_clip_norm: Optional[float] = Field(None, description="Clip gradients to this max norm, if provided")
+    early_stopping_patience: Optional[int] = Field(None, description="Number of epochs to wait for improvement before stopping")
+    early_stopping_monitor: str = Field("val_loss", description="Metric to monitor for early stopping")
+    early_stopping_mode: Literal["min", "max"] = Field("min", description="Mode for early stopping (min for loss, max for accuracy)")
+    
+    # NEW: Distributed Training Configuration
+    use_distributed: bool = Field(False, description="Whether to use DistributedDataParallel (requires torch.distributed.init_process_group)")
+    local_rank: int = Field(0, description="Local rank for distributed training (will be set by launcher)")
+    world_size: int = Field(1, description="Total number of distributed processes (will be set by launcher)")
+
+
+class ModelSpecificConfig(BaseModel):
+    """Base class for model-specific configurations. Plugins will extend this."""
+    pass
+
+class SimpleNNConfig(ModelSpecificConfig):
+    """Configuration for the Simple Neural Network plugin."""
+    input_dim: int = Field(..., description="Input dimension of the model")
+    hidden_dim: int = Field(128, description="Dimension of the hidden layer")
+    output_dim: int = Field(..., description="Output dimension of the model")
+    dropout_rate: float = Field(0.2, ge=0.0, le=1.0, description="Dropout rate for regularization")
+    activation_fn: Literal["ReLU", "Sigmoid", "Tanh", "GELU"] = Field("ReLU", description="Activation function to use in hidden layers")
+
+class ExperimentConfig(BaseModel):
+    """Overall experiment configuration."""
+    experiment_name: str = Field("default_experiment", description="Unique name for the experiment results folder")
+    model_plugin: str = Field(..., description="Name of the model plugin to use (e.g., 'simple_nn')")
+    dataset_plugin: str = Field(..., description="Name of the dataset plugin to use (e.g., 'simple_nn')")
+    
+    data_path: str = Field(..., description="Path to the raw data file(s) for the dataset")
+    preprocess_args: Dict[str, Any] = Field(default_factory=dict, description="Keyword arguments for the preprocessor's fit method")
+
+    model_config: ModelSpecificConfig = Field(..., description="Model-specific configuration instance")
+    training_config: TrainingConfig = Field(default_factory=TrainingConfig, description="Training loop configuration")
+
+    class Config:
+        pass
+```
+
+#### **3. `aiforge/core/base_model.py`**
+Update `save_checkpoint` to handle `DDP` wrapped models.
+
+```python
+# aiforge/core/base_model.py
+from abc import ABC, abstractmethod
+import torch
+import torch.nn as nn
+from typing import Dict, Any, Type, Optional
+from aiforge.core.logger import logger
+
+class BaseModel(nn.Module, ABC):
+    """
+    Abstract Base Class for all AI models.
+    Adheres to:
+    - OCP: Models extend BaseModel without modifying Orchestrator.
+    - LSP: Concrete models are substitutable for BaseModel.
+    """
+
+    def __init__(self, model_config: Any): # model_config type is Any, as it's polymorphic
+        super().__init__()
+        self.model_config = model_config
+        self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.loss_fn: Optional[nn.Module] = None
+        self.device: Optional[torch.device] = None # Will be set by Orchestrator
+
+    @abstractmethod
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Defines the forward pass of the model."""
+        pass
+
+    @abstractmethod
+    def training_step(self, batch: Dict[str, Any], batch_idx: int) -> Dict[str, Any]:
+        """
+        Defines a single training step.
+        Should return a dictionary containing 'loss' and any relevant metrics or predictions.
+        """
+        pass
+
+    @abstractmethod
+    def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> Dict[str, Any]:
+        """
+        Defines a single validation step.
+        Should return a dictionary containing 'loss' and any relevant metrics or predictions.
+        """
+        pass
+
+    @abstractmethod
+    def configure_optimizer(self, optimizer_name: str, learning_rate: float) -> torch.optim.Optimizer:
+        """
+        Configures and returns the optimizer for the model's parameters.
+        The model determines *how* its parameters are optimized, given the *choice* (optimizer_name)
+        and hyperparameters (learning_rate) from the Orchestrator.
+        """
+        pass
+    
+    @abstractmethod
+    def configure_loss_fn(self, loss_fn_name: str) -> nn.Module:
+        """
+        Configures and returns the loss function for the model.
+        The model defines *what* loss function is instantiated, given the *choice* (loss_fn_name)
+        from the Orchestrator.
+        """
+        pass
+
+    def save_checkpoint(self, path: str, is_distributed: bool = False):
+        """
+        Saves the model's state dictionary.
+        Handles DDP wrapped models by saving the underlying module's state.
+        """
+        if is_distributed and isinstance(self, nn.parallel.DistributedDataParallel):
+            torch.save(self.module.state_dict(), path)
+        else:
+            torch.save(self.state_dict(), path)
+        logger.info(f"Model checkpoint saved to {path}")
+
+    def load_checkpoint(self, path: str):
+        """Loads the model's state dictionary."""
+        self.load_state_dict(torch.load(path, map_location=self.device))
+        logger.info(f"Model checkpoint loaded from {path}")
+
+```
+
+#### **4. `aiforge/utils/callbacks.py`**
+Add `MLflowCallback` for experiment tracking.
+
+```python
+# aiforge/utils/callbacks.py
+from aiforge.core.logger import logger
+from typing import Dict, Any, Optional
+import mlflow # NEW
+import json # NEW
+
+class Callback:
+    """Base class for training callbacks."""
+    def on_epoch_end(self, epoch: int, logs: Dict[str, Any]):
+        """Called at the end of each epoch."""
+        pass
+    
+    # NEW: Lifecycle hooks for MLflow
+    def on_experiment_start(self, config: Any, run_id: Optional[str] = None):
+        """Called once at the start of the experiment."""
+        pass
+
+    def on_experiment_end(self, status: str):
+        """Called once at the end of the experiment."""
+        pass
+
+class EarlyStopping(Callback):
+    """
+    Callback for early stopping during training.
+    Stops training if the monitored metric does not improve for a given patience.
+    """
+    def __init__(self, patience: int, min_delta: float = 0.001, monitor: str = 'val_loss', mode: str = 'min'):
+        if mode not in ['min', 'max']:
+            raise ValueError("EarlyStopping mode must be 'min' or 'max'.")
+        self.patience = patience
+        self.min_delta = abs(min_delta) # delta should always be positive
+        self.monitor = monitor
+        self.mode = mode
+        self.best_value: float = float('inf') if mode == 'min' else float('-inf')
+        self.epochs_no_improve: int = 0
+        self.stop_training: bool = False
+        logger.info(f"EarlyStopping initialized: monitor='{monitor}', patience={patience}, min_delta={min_delta}, mode='{mode}'")
+
+    def on_epoch_end(self, epoch: int, logs: Dict[str, Any]):
+        current_value = logs.get(self.monitor)
+        if current_value is None:
+            logger.warning(f"EarlyStopping monitor '{self.monitor}' not found in logs for epoch {epoch}. Skipping check.")
+            return
+
+        if self.mode == 'min':
+            if current_value < self.best_value - self.min_delta:
+                self.best_value = current_value
+                self.epochs_no_improve = 0
+                logger.debug(f"Epoch {epoch}: {self.monitor} improved to {current_value:.4f}.")
+            else:
+                self.epochs_no_improve += 1
+                logger.debug(f"Epoch {epoch}: {self.monitor} did not improve ({current_value:.4f} vs best {self.best_value:.4f}). "
+                             f"No improvement for {self.epochs_no_improve} epochs.")
+        else: # mode == 'max'
+            if current_value > self.best_value + self.min_delta:
+                self.best_value = current_value
+                self.epochs_no_improve = 0
+                logger.debug(f"Epoch {epoch}: {self.monitor} improved to {current_value:.4f}.")
+            else:
+                self.epochs_no_improve += 1
+                logger.debug(f"Epoch {epoch}: {self.monitor} did not improve ({current_value:.4f} vs best {self.best_value:.4f}). "
+                             f"No improvement for {self.epochs_no_improve} epochs.")
+        
+        if self.epochs_no_improve >= self.patience:
+            self.stop_training = True
+            logger.info(f"Early stopping triggered for '{self.monitor}' after {epoch+1} epochs.")
+
+class MLflowCallback(Callback): # NEW
+    """
+    Callback to log metrics, parameters, and artifacts to MLflow.
+    Adheres to OCP: Extends Callback without changing Orchestrator core logic.
+    """
+    def __init__(self, experiment_name: str, run_id: Optional[str] = None):
+        self.experiment_name = experiment_name
+        self.run_id = run_id
+        
+        # MLflow setup (only for rank 0 in DDP)
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            mlflow.set_experiment(experiment_name)
+            logger.info(f"MLflowCallback initialized for experiment: {experiment_name}")
+            if run_id:
+                logger.info(f"MLflow run_id: {run_id}")
+
+    def on_experiment_start(self, config: Any, run_id: Optional[str] = None):
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if run_id:
+                mlflow.start_run(run_id=run_id)
+            else:
+                mlflow.start_run()
+            self.run_id = mlflow.active_run().info.run_id
+            logger.info(f"MLflow run started with ID: {self.run_id}")
+            
+            # Log all Pydantic config as parameters
+            mlflow.log_params(config.model_dump()) # Pydantic v2 .model_dump(), v1 .dict()
+
+    def on_epoch_end(self, epoch: int, logs: Dict[str, Any]):
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            with mlflow.start_run(run_id=self.run_id):
+                mlflow.log_metrics(logs, step=epoch)
+            logger.debug(f"MLflow logged metrics for epoch {epoch}")
+
+    def on_experiment_end(self, status: str, model_path: str, preprocessor_path: Optional[str] = None, config_path: Optional[str] = None):
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            with mlflow.start_run(run_id=self.run_id):
+                mlflow.log_artifact(model_path)
+                if preprocessor_path and preprocessor_path.exists():
+                    mlflow.log_artifact(str(preprocessor_path))
+                if config_path and config_path.exists():
+                    mlflow.log_artifact(str(config_path))
+                mlflow.set_tag("status", status)
+            mlflow.end_run()
+            logger.info(f"MLflow run {self.run_id} ended with status: {status}")
+
+```
+
+#### **5. `aiforge/core/orchestrator.py`**
+Major updates for Distributed Training and integration with injected dependencies.
+
+```python
+# aiforge/core/orchestrator.py
+import torch
+import torch.nn as nn # NEW
+import torch.optim as optim # NEW
+from torch.utils.data import DataLoader, DistributedSampler # NEW
+import torch.distributed as dist # NEW
+from aiforge.core.logger import logger
+from aiforge.core.base_model import BaseModel
+from aiforge.core.data_pipeline import BaseDataset, BasePreprocessor
+from aiforge.config.model_configs import ExperimentConfig, TrainingConfig
+from aiforge.config.settings import settings
+from aiforge.utils.callbacks import EarlyStopping, MLflowCallback, Callback # NEW: MLflowCallback
+from typing import Type, Dict, Any, Optional, List, Tuple
+import json
+import importlib
+
+class Orchestrator:
+    """
+    Manages the end-to-end AI experiment lifecycle:
+    configuration, data loading, preprocessing, model training, and evaluation.
+    Adheres to SOLID principles by depending on abstractions.
+    """
+    def __init__(self, 
+                 experiment_config: ExperimentConfig,
+                 ModelClass: Type[BaseModel], # NEW: Injected dependency
+                 DatasetClass: Type[BaseDataset], # NEW: Injected dependency
+                 PreprocessorClass: Optional[Type[BasePreprocessor]] = None, # NEW: Injected dependency
+                 mlflow_run_id: Optional[str] = None # NEW: Passed from main.py if distributed
+                 ):
+        self.config = experiment_config
+        self.mlflow_run_id = mlflow_run_id # Pass run_id for distributed mlflow logging
+
+        # NEW: Distributed setup based on config
+        self.is_distributed = self.config.training_config.use_distributed and dist.is_initialized()
+        if self.is_distributed:
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            self.device = torch.device(f"cuda:{self.rank}")
+            logger.info(f"Rank {self.rank}/{self.world_size} initialized on {self.device}")
+        else:
+            self.rank = 0 # Default to rank 0 for non-distributed runs
+            self.world_size = 1
+            self.device = torch.device(settings.DEVICE)
+            logger.info(f"Non-distributed run initialized on {self.device}")
+        
+        self.ModelClass = ModelClass
+        self.DatasetClass = DatasetClass
+        self.PreprocessorClass = PreprocessorClass
+
+        self.model: Optional[BaseModel] = None
+        self.dataset: Optional[BaseDataset] = None
+        self.preprocessor: Optional[BasePreprocessor] = None
+        
+        self.train_dataloader: Optional[DataLoader] = None
+        self.val_dataloader: Optional[DataLoader] = None
+        
+        self._initialize_model() # Now happens with loaded ModelClass
+        
+        # Setup result directory (only for rank 0 or non-distributed)
+        self.experiment_results_dir = settings.RESULTS_DIR / self.config.experiment_name
+        if self.rank == 0:
+            self.experiment_results_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Experiment results will be stored in: {self.experiment_results_dir}")
+
+        self.callbacks: List[Callback] = []
+        if self.config.training_config.early_stopping_patience:
+            self.callbacks.append(
+                EarlyStopping(
+                    patience=self.config.training_config.early_stopping_patience,
+                    monitor=self.config.training_config.early_stopping_monitor,
+                    mode=self.config.training_config.early_stopping_mode
+                )
+            )
+        # NEW: MLflow callback (only for rank 0 or non-distributed)
+        if self.rank == 0:
+            self.mlflow_callback = MLflowCallback(self.config.experiment_name, run_id=self.mlflow_run_id)
+            self.callbacks.append(self.mlflow_callback)
+            self.mlflow_callback.on_experiment_start(self.config, run_id=self.mlflow_run_id) # Start MLflow run
+        else:
+            self.mlflow_callback = None
+
+
+    def _initialize_model(self):
+        """
+        Initializes the model, its optimizer, and loss function.
+        Model-specific configuration is passed to the model's constructor.
+        Wraps the model in DDP if distributed training is enabled.
+        """
+        if self.ModelClass is None:
+            raise RuntimeError("ModelClass not loaded.")
+
+        self.model = self.ModelClass(model_config=self.config.model_config)
+        self.model.device = self.device # Set model's device property
+        self.model = self.model.to(self.device)
+        
+        # NEW: Wrap model with DistributedDataParallel
+        if self.is_distributed:
+            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.device.index])
+            logger.info(f"Rank {self.rank}: Model wrapped in DistributedDataParallel.")
+        
+        self.model.optimizer = self.model.configure_optimizer(
+            self.config.training_config.optimizer_name,
+            self.config.training_config.learning_rate
+        )
+        self.model.loss_fn = self.model.configure_loss_fn(
+            self.config.training_config.loss_fn_name
+        )
+        logger.info(f"Rank {self.rank}: Model initialized: {self.model.__class__.__name__} on {self.device}")
+        if self.rank == 0: # Only print architecture from rank 0
+            logger.debug(f"Model Architecture:\n{self.model}")
+
+    def prepare_data(self):
+        """
+        Loads the dataset and optionally applies preprocessing.
+        Uses DistributedSampler if distributed training is enabled.
+        """
+        if self.DatasetClass is None:
+            raise RuntimeError("DatasetClass not loaded.")
+
+        if self.rank == 0: # Only log data loading from rank 0
+            logger.info(f"Loading data from {self.config.data_path} using {self.DatasetClass.__name__}...")
+        self.dataset = self.DatasetClass()
+        self.dataset.load_data(self.config.data_path, # Pass rank/world_size if dataset needs it
+                                rank=self.rank, 
+                                world_size=self.world_size,
+                                is_distributed=self.is_distributed) 
+
+        if self.PreprocessorClass:
+            self.preprocessor = self.PreprocessorClass()
+            if self.rank == 0: # Only fit/save preprocessor from rank 0
+                logger.info(f"Fitting preprocessor {self.preprocessor.__class__.__name__}...")
+                all_features = [self.dataset[i]['features'] for i in range(len(self.dataset))]
+                self.preprocessor.fit(all_features, **self.config.preprocess_args)
+                self.preprocessor.save(self.experiment_results_dir / 'preprocessor.pkl')
+                logger.info(f"Preprocessor fitted and saved to {self.experiment_results_dir / 'preprocessor.pkl'}")
+            
+            # Ensure preprocessor is loaded on all ranks if it was saved by rank 0
+            if self.is_distributed:
+                dist.barrier() # Wait for rank 0 to save preprocessor
+            if self.rank != 0 and self.experiment_results_dir.exists():
+                self.preprocessor.load(self.experiment_results_dir / 'preprocessor.pkl')
+
+            self.dataset.preprocessor = self.preprocessor 
+            logger.debug(f"Rank {self.rank}: Preprocessor state attached to dataset.")
+        
+        # NEW: DistributedSampler for DDP
+        train_sampler = DistributedSampler(self.dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True) if self.is_distributed else None
+        val_sampler = DistributedSampler(self.dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False) if self.is_distributed else None
+
+        # Split dataset for training and validation (apply only on main dataset if using sampler)
+        train_size = int(0.8 * len(self.dataset))
+        val_size = len(self.dataset) - train_size
+        
+        # Create dummy generator for random_split if not using DistributedSampler.
+        # When using DistributedSampler, the dataset itself is not split, the sampler handles it.
+        if not self.is_distributed:
+            generator = torch.Generator().manual_seed(42) 
+            train_dataset, val_dataset = torch.utils.data.random_split(self.dataset, [train_size, val_size], generator=generator)
+        else:
+            # When using DDP, usually the entire dataset is passed to DataLoader, and the sampler
+            # takes care of partitioning data for each rank.
+            train_dataset = self.dataset # The DistributedSampler will select subsets for each rank
+            val_dataset = self.dataset # Same for validation for simplicity, in production you might have a dedicated val set.
+
+
+        self.train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=self.config.training_config.batch_size, 
+            shuffle=(train_sampler is None), # Shuffle only if no sampler is provided
+            sampler=train_sampler
+        )
+        self.val_dataloader = DataLoader(
+            val_dataset, 
+            batch_size=self.config.training_config.batch_size, 
+            shuffle=(val_sampler is None),
+            sampler=val_sampler
+        )
+        if self.rank == 0:
+            logger.info(f"Data prepared: {len(train_dataset)} training samples (per rank if distributed), "
+                        f"{len(val_dataset)} validation samples (per rank if distributed).")
+        logger.debug(f"Rank {self.rank}: Dataloaders created with batch size {self.config.training_config.batch_size}.")
+
+
+    def train(self):
+        """Executes the training loop."""
+        if not self.model or not self.train_dataloader or not self.val_dataloader:
+            raise RuntimeError("Model or data not prepared for training.")
+
+        if self.rank == 0:
+            logger.info(f"Starting training for {self.config.training_config.epochs} epochs...")
+        
+        best_monitor_value = float('inf') if self.config.training_config.early_stopping_mode == 'min' else float('-inf')
+        
+        for epoch in range(self.config.training_config.epochs):
+            if self.is_distributed:
+                self.train_dataloader.sampler.set_epoch(epoch) # Important for shuffling across epochs
+
+            self.model.train()
+            total_train_loss = 0
+            for batch_idx, batch in enumerate(self.train_dataloader):
+                self.model.optimizer.zero_grad()
+                
+                inputs = batch['features'].to(self.device)
+                targets = batch['labels'].to(self.device)
+                
+                step_outputs = self.model.training_step({'features': inputs, 'labels': targets}, batch_idx)
+                loss = step_outputs['loss']
+                
+                loss.backward()
+
+                if self.config.training_config.gradient_clip_norm:
+                    # Clip gradients on all model parameters (including DDP module)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training_config.gradient_clip_norm)
+
+                self.model.optimizer.step()
+                total_train_loss += loss.item()
+            
+            avg_train_loss = total_train_loss / len(self.train_dataloader)
+            
+            # Validation step
+            avg_val_loss, val_metrics = self.evaluate(self.val_dataloader)
+            
+            # For DDP, gather metrics from all ranks (only if actually distributed and on rank 0)
+            if self.is_distributed:
+                dist.barrier() # Wait for all ranks to complete epoch and evaluation
+                # Reduce average train loss across all ranks
+                gathered_train_loss = [torch.tensor(0.0).to(self.device) for _ in range(self.world_size)]
+                dist.all_gather(gathered_train_loss, torch.tensor(avg_train_loss).to(self.device))
+                avg_train_loss = torch.tensor(gathered_train_loss).mean().item()
+
+                # Reduce average val loss across all ranks
+                gathered_val_loss = [torch.tensor(0.0).to(self.device) for _ in range(self.world_size)]
+                dist.all_gather(gathered_val_loss, torch.tensor(avg_val_loss).to(self.device))
+                avg_val_loss = torch.tensor(gathered_val_loss).mean().item()
+
+                # Reduce other metrics (e.g., accuracy)
+                for metric_name, metric_value in list(val_metrics.items()): # Use list to modify dict during iteration
+                    gathered_metric = [torch.tensor(0.0).to(self.device) for _ in range(self.world_size)]
+                    dist.all_gather(gathered_metric, torch.tensor(metric_value).to(self.device))
+                    val_metrics[metric_name] = torch.tensor(gathered_metric).mean().item()
+            
+            if self.rank == 0: # Only log and apply callbacks on rank 0
+                logs = {
+                    'train_loss': avg_train_loss,
+                    'val_loss': avg_val_loss,
+                    **val_metrics
+                }
+                logger.info(f"Epoch {epoch+1}/{self.config.training_config.epochs} | "
+                            f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
+                            f"Val Metrics: {val_metrics}")
+
+                # Callbacks
+                for callback in self.callbacks:
+                    callback.on_epoch_end(epoch, logs)
+                    if isinstance(callback, EarlyStopping) and callback.stop_training:
+                        logger.info(f"Early stopping triggered after {epoch+1} epochs.")
+                        self.model.save_checkpoint(self.experiment_results_dir / "best_model.pth", is_distributed=self.is_distributed)
+                        return # Exit training loop
+
+                # Update best model based on monitor metric
+                monitor_value = logs.get(self.config.training_config.early_stopping_monitor)
+                if monitor_value is not None:
+                    if (self.config.training_config.early_stopping_mode == 'min' and monitor_value < best_monitor_value) or \
+                       (self.config.training_config.early_stopping_mode == 'max' and monitor_value > best_monitor_value):
+                        best_monitor_value = monitor_value
+                        self.model.save_checkpoint(self.experiment_results_dir / "best_model.pth", is_distributed=self.is_distributed)
+                        logger.debug(f"Saved best model to {self.experiment_results_dir / 'best_model.pth'}")
+
+        if self.rank == 0:
+            logger.info("Training complete.")
+            # If no early stopping, ensure the best model is loaded if it was ever saved.
+            if (self.experiment_results_dir / "best_model.pth").exists():
+                self.model.load_checkpoint(self.experiment_results_dir / "best_model.pth")
+        
+        if self.is_distributed: # Ensure all ranks exit gracefully
+            dist.barrier()
+
+
+    def evaluate(self, dataloader: DataLoader) -> Tuple[float, Dict[str, Any]]:
+        """Evaluates the model on a given dataloader."""
+        if not self.model:
+            raise RuntimeError("Model not initialized for evaluation.")
+
+        self.model.eval()
+        total_loss = 0
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                inputs = batch['features'].to(self.device)
+                targets = batch['labels'].to(self.device)
+                
+                step_outputs = self.model.validation_step({'features': inputs, 'labels': targets}, batch_idx)
+                loss = step_outputs['loss']
+                total_loss += loss.item()
+                
+                if 'predictions' in step_outputs:
+                    # Ensure predictions from DDP model are gathered correctly if needed,
+                    # here we just take the output of the local model
+                    # For simplicity, gathering only for accuracy calculation.
+                    all_preds.append(step_outputs['predictions'].cpu())
+                all_targets.append(targets.cpu())
+
+        avg_loss = total_loss / len(dataloader)
+        
+        metrics = {}
+        if all_preds and all_targets:
+            if self.config.training_config.loss_fn_name == "CrossEntropyLoss":
+                preds = torch.cat(all_preds)
+                targets = torch.cat(all_targets)
+                correct = (preds.argmax(dim=1) == targets).sum().item()
+                accuracy_val = correct / len(targets)
+                metrics['accuracy'] = accuracy_val
+            # Add other metrics as needed based on the task
+
+        return avg_loss, metrics
+
+    def run_experiment(self):
+        """Runs the entire experiment: data prep, train, final eval."""
+        if self.rank == 0:
+            logger.info(f"--- Starting Experiment: {self.config.experiment_name} ---")
+            
+            # Save experiment config (only on rank 0)
+            config_path = self.experiment_results_dir / "experiment_config.json"
+            with open(config_path, "w") as f:
+                f.write(self.config.json(indent=2))
+            logger.info(f"Experiment configuration saved to {config_path}")
+
+        self.prepare_data()
+        self.train()
+        
+        # Final evaluation and results saving (only on rank 0)
+        if self.rank == 0:
+            logger.info("Running final evaluation on validation set...")
+            final_val_loss, final_val_metrics = self.evaluate(self.val_dataloader)
+            logger.info(f"Final Validation Loss: {final_val_loss:.4f} | Final Metrics: {final_val_metrics}")
+            
+            # Save final model
+            final_model_path = self.experiment_results_dir / "final_model.pth"
+            self.model.save_checkpoint(final_model_path, is_distributed=self.is_distributed)
+            
+            final_results = {
+                "final_val_loss": final_val_loss,
+                "final_val_metrics": final_val_metrics,
+                "model_path": str(final_model_path),
+                "preprocessor_path": str(self.experiment_results_dir / 'preprocessor.pkl') if self.preprocessor else None,
+                "config_path": str(config_path)
+            }
+            with open(self.experiment_results_dir / "final_results.json", "w") as f:
+                json.dump(final_results, f, indent=2)
+
+            logger.info(f"Experiment '{self.config.experiment_name}' finished.")
+            logger.info(f"Results available in {self.experiment_results_dir}")
+            
+            # NEW: End MLflow run
+            if self.mlflow_callback:
+                self.mlflow_callback.on_experiment_end("FINISHED", str(final_model_path), 
+                                                        preprocessor_path=self.experiment_results_dir / 'preprocessor.pkl' if self.preprocessor else None,
+                                                        config_path=config_path)
+        
+        if self.is_distributed: # Ensure all ranks exit gracefully
+            dist.destroy_process_group() # Clean up DDP process group
+```
+
+#### **6. `aiforge/plugins/simple_nn/dataset.py`**
+Update `load_data` to handle `DistributedSampler` arguments, even if not directly used for splitting here.
+
+```python
+# aiforge/plugins/simple_nn/dataset.py
+import torch
+from torch.utils.data import Dataset
+from aiforge.core.data_pipeline import BaseDataset, BasePreprocessor # Import BasePreprocessor
+from aiforge.core.logger import logger
+from typing import Dict, Any, List, Optional
+
+class Dataset(BaseDataset):
+    """
+    A dummy dataset for simple classification.
+    Can also apply preprocessing if a preprocessor is provided.
+    """
+    def __init__(self, preprocessor: Optional[BasePreprocessor] = None):
+        super().__init__()
+        self.data: List[Dict[str, torch.Tensor]] = []
+        self.preprocessor = preprocessor
+        logger.debug("DummyDataset initialized.")
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        item = self.data[idx]
+        if self.preprocessor:
+            return self.preprocessor.transform(item) # Apply transform on retrieval
+        return item
+
+    def load_data(self, data_path: str, num_samples: int = 1000, input_dim: int = 10, num_classes: int = 2, # NEW: DDP args
+                  rank: int = 0, world_size: int = 1, is_distributed: bool = False): # NEW
+        """
+        Generates dummy data for classification.
+        DDP args (rank, world_size) are accepted but not directly used for data generation
+        since DistributedSampler handles partitioning from the full dataset.
+        """
+        if rank == 0: # Only log data generation from rank 0
+            logger.info(f"Generating {num_samples} dummy samples for input_dim={input_dim}, num_classes={num_classes}...")
+        self.data = []
+        # Use a fixed seed for reproducibility of dummy data
+        torch.manual_seed(42) 
+        for i in range(num_samples):
+            features = torch.randn(input_dim) * 2 + 1 # Add some variance and mean offset
+            labels = torch.randint(0, num_classes, (1,)).squeeze(0) 
+            self.data.append({'features': features, 'labels': labels})
+        if rank == 0:
+            logger.info("Dummy data loaded.")
+
+```
+
+#### **7. `aiforge/container.py` (NEW FILE)**
+This file defines the `dependency-injector` container, which will manage the creation and wiring of all components.
+
+```python
+# aiforge/container.py
+from dependency_injector import containers, providers
+import importlib
+from typing import Type, Optional
+
+from aiforge.core.orchestrator import Orchestrator
+from aiforge.core.base_model import BaseModel
+from aiforge.core.data_pipeline import BaseDataset, BasePreprocessor
+from aiforge.config.model_configs import ExperimentConfig, SimpleNNConfig, TrainingConfig, ModelSpecificConfig
+from aiforge.config.settings import settings
+from aiforge.core.logger import logger
+
+class Container(containers.DeclarativeContainer):
+    """
+    Dependency Injection Container for AIForge components.
+    Adheres to DIP: Orchestrator receives abstractions, not concretions.
+    """
+    wiring_config = containers.WiringConfiguration(modules=["aiforge.main"])
+
+    # --- Configuration providers ---
+    experiment_config = providers.Singleton(
+        ExperimentConfig,
+        experiment_name=providers.Object(None), # Will be overridden at runtime
+        model_plugin=providers.Object(None),    # Will be overridden at runtime
+        dataset_plugin=providers.Object(None),  # Will be overridden at runtime
+        data_path=providers.Object(None),       # Will be overridden at runtime
+        model_config=providers.Object(None),    # Will be overridden at runtime
+        training_config=providers.Singleton(TrainingConfig) # Can be overridden or used as default
+    )
+
+    # --- Plugin Loader provider ---
+    # This provider dynamically loads the classes based on plugin names in ExperimentConfig
+    # and ensures they conform to the abstract base classes.
+    @providers.Factory
+    def plugin_model_class(experiment_config_instance: ExperimentConfig) -> Type[BaseModel]:
+        model_module_path = f"aiforge.plugins.{experiment_config_instance.model_plugin}.model"
+        try:
+            plugin_model_module = importlib.import_module(model_module_path)
+            model_class = getattr(plugin_model_module, "Model")
+            if not issubclass(model_class, BaseModel):
+                raise TypeError(f"Model class '{model_class.__name__}' from plugin "
+                                f"'{experiment_config_instance.model_plugin}' does not inherit from BaseModel.")
+            return model_class
+        except (ImportError, AttributeError) as e:
+            logger.error(f"Failed to load ModelClass for plugin '{experiment_config_instance.model_plugin}': {e}")
+            raise
+
+    @providers.Factory
+    def plugin_dataset_class(experiment_config_instance: ExperimentConfig) -> Type[BaseDataset]:
+        dataset_module_path = f"aiforge.plugins.{experiment_config_instance.dataset_plugin}.dataset"
+        try:
+            plugin_dataset_module = importlib.import_module(dataset_module_path)
+            dataset_class = getattr(plugin_dataset_module, "Dataset")
+            if not issubclass(dataset_class, BaseDataset):
+                raise TypeError(f"Dataset class '{dataset_class.__name__}' from plugin "
+                                f"'{experiment_config_instance.dataset_plugin}' does not inherit from BaseDataset.")
+            return dataset_class
+        except (ImportError, AttributeError) as e:
+            logger.error(f"Failed to load DatasetClass for plugin '{experiment_config_instance.dataset_plugin}': {e}")
+            raise
+
+    @providers.Factory
+    def plugin_preprocessor_class(experiment_config_instance: ExperimentConfig) -> Optional[Type[BasePreprocessor]]:
+        preprocessor_module_path = f"aiforge.plugins.{experiment_config_instance.dataset_plugin}.preprocessor"
+        try:
+            plugin_preprocessor_module = importlib.import_module(preprocessor_module_path)
+            preprocessor_class = getattr(plugin_preprocessor_module, "Preprocessor")
+            if not issubclass(preprocessor_class, BasePreprocessor):
+                raise TypeError(f"Preprocessor class '{preprocessor_class.__name__}' from plugin "
+                                f"'{experiment_config_instance.dataset_plugin}' does not inherit from BasePreprocessor.")
+            return preprocessor_class
+        except (ImportError, AttributeError):
+            logger.warning(f"No PreprocessorClass found for plugin '{experiment_config_instance.dataset_plugin}'.")
+            return None
+
+    # --- Orchestrator provider (injects dependencies) ---
+    orchestrator = providers.Factory(
+        Orchestrator,
+        experiment_config=experiment_config,
+        ModelClass=plugin_model_class,
+        DatasetClass=plugin_dataset_class,
+        PreprocessorClass=plugin_preprocessor_class,
+        mlflow_run_id=providers.Object(None) # Will be set at runtime for MLflow
+    )
+
+# --- Dynamic Configuration Example (Outside of container definition, typically in main.py) ---
+# To configure the ExperimentConfig dynamically, you'd do:
+# container.experiment_config.override(ExperimentConfig(
+#     experiment_name="my_dynamic_exp",
+#     model_plugin="simple_nn",
+#     dataset_plugin="simple_nn",
+#     data_path="path/to/data",
+#     model_config=SimpleNNConfig(input_dim=10, output_dim=2)
+# ))
+```
+
+#### **8. `aiforge/main.py`**
+Update the main entry point to utilize the DI container and manage DDP setup.
+
+```python
+# aiforge/main.py
+import torch
+import torch.distributed as dist # NEW
+import os # NEW
+import mlflow # NEW
+
+from aiforge.core.orchestrator import Orchestrator
+from aiforge.config.model_configs import ExperimentConfig, SimpleNNConfig, TrainingConfig
+from aiforge.config.settings import settings
+from aiforge.core.logger import logger
+from aiforge.container import Container # NEW: Import the DI Container
+
+def setup_distributed(rank, world_size, backend='nccl'): # NEW
+    """Initializes the distributed environment."""
+    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    logger.info(f"Distributed process group initialized for rank {rank} / {world_size}.")
+    torch.cuda.set_device(rank) # Set device for current process
+
+
+def cleanup_distributed(): # NEW
+    """Cleans up the distributed environment."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+        logger.info("Distributed process group destroyed.")
+
+
+def run_simple_nn_experiment(config: ExperimentConfig, mlflow_run_id: Optional[str] = None): # NEW: Accepts config
+    # Configure the DI container with the specific experiment config
+    container = Container()
+    container.experiment_config.override(config)
+    container.mlflow_run_id.override(mlflow_run_id) # Pass MLflow run_id if available
+
+    # Resolve Orchestrator from the container
+    orchestrator: Orchestrator = container.orchestrator()
+    orchestrator.run_experiment()
+
+def main():
+    # Ensure Loguru's level is set based on AppSettings
+    logger.level(settings.LOG_LEVEL)
+
+    # 1. --- Define experiment configurations (can be loaded from YAML/JSON too) ---
+    dummy_data_file = settings.DATA_DIR / "dummy_classification_data.pkl" 
+
+    model_config_instance = SimpleNNConfig(
+        input_dim=10,        # Matches the dummy data generation
+        hidden_dim=64,
+        output_dim=2,        # For 2-class classification
+        dropout_rate=0.3,
+        activation_fn="ReLU"
+    )
+
+    training_config_instance = TrainingConfig(
+        epochs=5,
+        batch_size=16,
+        learning_rate=0.005,
+        optimizer_name="Adam",
+        loss_fn_name="CrossEntropyLoss",
+        early_stopping_patience=2,
+        early_stopping_monitor="val_loss",
+        early_stopping_mode="min",
+        
+        # NEW: Distributed training defaults (will be overridden by launcher)
+        use_distributed=False, 
+        local_rank=0,
+        world_size=1
+    )
+
+    experiment_config_instance = ExperimentConfig(
+        experiment_name="simple_nn_classification_experiment_enterprise", # New experiment name
+        model_plugin="simple_nn",
+        dataset_plugin="simple_nn",
+        data_path=str(dummy_data_file),
+        preprocess_args={"scaler_type": "standard"},
+        model_config=model_config_instance,
+        training_config=training_config_instance
+    )
+
+    # 2. --- Handle Distributed Training Setup ---
+    # `torch.distributed.launch` or `torchrun` sets these env vars
+    is_distributed_launch = int(os.environ.get('RANK', -1)) != -1 # Check if launched by torchrun
+    if is_distributed_launch:
+        local_rank = int(os.environ['LOCAL_RANK'])
+        global_rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        
+        experiment_config_instance.training_config.use_distributed = True
+        experiment_config_instance.training_config.local_rank = local_rank
+        experiment_config_instance.training_config.world_size = world_size
+        
+        setup_distributed(global_rank, world_size) # Initialize DDP for this process
+        logger.info(f"Main: DDP launcher detected. Running as global_rank {global_rank} / {world_size}.")
+    else:
+        logger.info("Main: Running in single-process mode.")
+
+    # 3. --- MLflow setup (only for rank 0) ---
+    mlflow_run_id: Optional[str] = None
+    # For distributed runs, only rank 0 starts/ends the MLflow run.
+    # Other ranks log to the same run_id.
+    current_rank = int(os.environ.get('RANK', 0)) # Default to 0 if not DDP
+    if current_rank == 0:
+        mlflow.set_experiment(experiment_config_instance.experiment_name)
+        with mlflow.start_run() as run:
+            mlflow_run_id = run.info.run_id
+            logger.info(f"Main: MLflow run initiated with ID: {mlflow_run_id}")
+            # Log all config parameters directly to MLflow from rank 0
+            mlflow.log_params(experiment_config_instance.model_dump())
+    
+    # NEW: Pass MLflow run_id to all orchestrator instances for logging
+    if is_distributed_launch:
+        # Use a barrier and broadcast the MLflow run_id from rank 0 to other ranks
+        if current_rank == 0:
+            run_id_tensor = torch.tensor([int(mlflow_run_id, 16)]).to(f"cuda:{local_rank}") # Convert UUID string to int
+        else:
+            run_id_tensor = torch.tensor([0]).to(f"cuda:{local_rank}")
+        
+        dist.barrier()
+        dist.broadcast(run_id_tensor, src=0)
+        if current_rank != 0:
+            mlflow_run_id = hex(run_id_tensor.item())[2:] # Convert back to hex string
+            logger.info(f"Main: Rank {current_rank} received MLflow run ID: {mlflow_run_id}")
+
+    # 4. --- Run the experiment ---
+    try:
+        run_simple_nn_experiment(experiment_config_instance, mlflow_run_id)
+    except Exception as e:
+        logger.error(f"Experiment failed: {e}", exc_info=True)
+    finally:
+        cleanup_distributed() # Clean up DDP process group
+
+if __name__ == "__main__":
+    main()
+
+```
+
+---
+
+### **V. How to Run & Key Principles**
+
+**1. Setup:**
+   - Create the directory structure as specified.
+   - Place the Python files in their respective folders.
+   - Install dependencies: `pip install -r requirements.txt`
+   - You can create an `.env` file in the project root (`aiforge/`) to override settings (e.g., `AIFORGE_DEVICE=cpu`).
+   - For MLflow, ensure you have an MLflow tracking server running or it will log locally (`mlflow ui` to view local runs).
+
+**2. Execution:**
+
+   **a. Single-Process (non-distributed) Run:**
+     - Simply run `python aiforge/main.py` from your terminal in the `aiforge/` project root.
+     - MLflow will start a run and log to your default tracking URI (usually `mlruns/` locally).
+
+   **b. Multi-GPU (Distributed) Run (requires PyTorch Distributed):**
+     - You'll need a machine with multiple GPUs and PyTorch installed with CUDA support.
+     - Use `torchrun` (or `torch.distributed.launch` for older PyTorch versions) to launch:
+       ```bash
+       torchrun --standalone --nproc_per_node=2 aiforge/main.py
+       ```
+       (Replace `2` with the number of GPUs you want to use.)
+     - Each GPU will run a separate process, and the `Orchestrator` instances will coordinate. MLflow will log from rank 0.
+
+**3. Key Principles in Action:**
+
+   -   **Distributed Training (PyTorch DDP)**:
+        -   The `Orchestrator` now detects if `dist.is_initialized()` and adapts.
+        -   `torch.cuda.set_device(rank)` is called for each process.
+        -   `nn.parallel.DistributedDataParallel` wraps the model.
+        -   `DistributedSampler` is used with `DataLoader` to ensure each GPU gets a unique subset of data.
+        -   Metrics are gathered from all ranks to rank 0 for aggregated logging.
+        -   Model checkpoints are saved from the `model.module` in DDP, ensuring only the core model state is saved.
+        -   `dist.barrier()` ensures synchronization between ranks, especially for preprocessor loading and MLflow logging.
+
+   -   **Experiment Tracking (MLflow)**:
+        -   `MLflowCallback` is a new `Callback` that the `Orchestrator` uses.
+        -   It logs `ExperimentConfig` parameters at the start of the run (from rank 0).
+        -   It logs epoch-end metrics (`train_loss`, `val_loss`, `accuracy`) during training.
+        -   It logs the final model checkpoint, preprocessor, and experiment configuration as artifacts at the end of the run.
+        -   Crucially, MLflow logging is only performed by `rank 0` in a distributed setting to avoid duplicate logs.
+
+   -   **Dependency Injection Container (`dependency-injector`)**:
+        -   The `Container` class in `aiforge/container.py` defines how `Orchestrator` and its dependencies are constructed.
+        -   `Orchestrator`'s `__init__` method now directly accepts `ModelClass`, `DatasetClass`, `PreprocessorClass`, adhering to **DIP**.
+        -   The `plugin_model_class`, `plugin_dataset_class`, and `plugin_preprocessor_class` providers in the `Container` dynamically import and type-check the plugin classes, effectively replacing the old `_load_plugin_components` logic within `Orchestrator`.
+        -   `main.py` is simplified; it configures the `Container` and then `orchestrator = container.orchestrator()` takes care of the complex instantiation.
+
+This enhanced AIForge framework is now equipped for enterprise-grade AI development, offering scalability, rigorous tracking, and flexible component management.
